@@ -16,9 +16,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 use crate::app::{
-    App, BorrowGuard, POINTER_TIMER_ID, WM_APP_SHOW_MENU, is_borrowed, on_pointer_check,
+    App, BorrowGuard, DESKTOP_TIMER_ID, POINTER_TIMER_ID, WM_APP_SHOW_MENU, is_borrowed,
+    on_pointer_check,
 };
 use crate::config::WM_APP_RELOAD_CONFIG;
+use crate::desktop::{self, WM_APP_DESKTOP};
 use crate::input;
 use crate::instance::WM_APP_ALREADY_RUNNING;
 use crate::tray::{self, WM_TRAY_CALLBACK};
@@ -111,6 +113,7 @@ fn start(app: &mut App) -> Result<(), String> {
         }
     }
     app.arm_idle_timer();
+    desktop::install_hook(app.hwnd);
     Ok(())
 }
 
@@ -175,9 +178,15 @@ unsafe extern "system" fn wndproc(
         WM_TIMER => {
             if wparam.0 == POINTER_TIMER_ID {
                 on_pointer_check(app);
+            } else if wparam.0 == DESKTOP_TIMER_ID {
+                App::on_prompt_check(app);
             } else {
                 App::on_timer(app);
             }
+            LRESULT(0)
+        }
+        WM_APP_DESKTOP => {
+            App::on_prompt_check(app);
             LRESULT(0)
         }
         WM_APP_SHOW_MENU => {

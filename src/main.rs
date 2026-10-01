@@ -6,6 +6,7 @@ mod app;
 mod autostart;
 mod config;
 mod cursor;
+mod desktop;
 mod input;
 mod instance;
 mod tray;
