@@ -1,0 +1,27 @@
+# IDE's and editors
+**/.vs
+**/.vscode
+**/.idea
+
+# per user visual studio things
+**/*.csproj.user
+**/*.json.user
+
+# agent harnesses
+**/.cursor
+**/.claude
+**/.codex
+
+# build dirs
+target/
+
+# package manager dependencies
+**/node_modules
+
+# local application data
+.data/
+
+# config/secret files
+**/.env
+**/.env.*
+!**/.env.example # keep .env.example as template
