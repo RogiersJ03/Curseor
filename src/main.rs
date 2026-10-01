@@ -1,4 +1,6 @@
 #![windows_subsystem = "windows"]
+#![warn(clippy::missing_safety_doc)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 mod app;
 mod autostart;
@@ -58,12 +60,15 @@ fn run() -> Result<(), String> {
     if let Err(error) = autostart::set(settings.start_with_windows) {
         tracing::error!("{error}");
     }
-    let mut app = App::new(settings, config_path);
-    window::run(&mut app)
+    let app = App::new(settings, config_path);
+    window::run(app)
 }
 
 pub(crate) fn message_box(message: &str) {
     let wide = wide_text(message);
+    // SAFETY: `wide` is NUL-terminated. MessageBoxW copies the text before it returns.
+    // The dialog runs its own loop. An active App borrow makes the window procedure
+    // skip forming another reference until that borrow ends.
     unsafe {
         let _ = MessageBoxW(
             None,
@@ -89,6 +94,8 @@ fn require_windows_11() -> Result<(), String> {
         platform_id: 0,
         service_pack: [0; 128],
     };
+    // SAFETY: `info.size` is the byte size of `OsVersionInfoW`, which matches `OSVERSIONINFOW`.
+    // RtlGetVersion writes into that struct and does not retain the pointer.
     let status = unsafe { RtlGetVersion(&mut info) };
     if status != 0 {
         return Err("Curseor requires Windows 11.".into());
@@ -148,5 +155,8 @@ struct OsVersionInfoW {
 }
 
 unsafe extern "system" {
+    /// # Safety
+    ///
+    /// `info` must point to a live [`OsVersionInfoW`] whose `size` field is the struct size.
     fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
 }

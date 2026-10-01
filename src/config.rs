@@ -146,6 +146,7 @@ pub fn set_integer(path: &Path, key: &str, new_value: i64) -> Result<(), String>
 
 pub fn open_settings(path: &Path) {
     let wide = wide_path(path);
+    // SAFETY: `wide` is a NUL-terminated path and outlives the call. "open" is a static verb.
     let opened = unsafe {
         ShellExecuteW(
             None,
@@ -163,6 +164,7 @@ pub fn open_settings(path: &Path) {
     quoted.push_str(&path.display().to_string());
     quoted.push('"');
     let parameter = wide_text(&quoted);
+    // SAFETY: the verb, program, and `parameter` are NUL-terminated and outlive the call.
     unsafe {
         let _ = ShellExecuteW(
             None,
@@ -212,6 +214,8 @@ fn watch_loop(receiver: mpsc::Receiver<()>, hwnd: isize) {
     while receiver.recv().is_ok() {
         std::thread::sleep(Duration::from_millis(300));
         while receiver.try_recv().is_ok() {}
+        // SAFETY: `hwnd` is the Curseor window handle passed in as an integer.
+        // PostMessage queues WM_APP_RELOAD_CONFIG and does not call the window procedure.
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_APP_RELOAD_CONFIG, WPARAM(0), LPARAM(0));
         }
@@ -262,6 +266,8 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     }
     let from = wide_path(&temporary);
     let to = wide_path(path);
+    // SAFETY: both paths are NUL-terminated and outlive the call. REPLACE_EXISTING is
+    // what lets the temporary file take the place of the settings file.
     let moved = unsafe {
         MoveFileExW(
             PCWSTR(from.as_ptr()),
@@ -310,6 +316,8 @@ fn threshold_key(document: &DocumentMut, default: i32) -> Result<i32, String> {
 }
 
 fn known_folder(id: &GUID) -> Result<PathBuf, String> {
+    // SAFETY: `id` points at a static folder id. On success the API returns a
+    // CoTaskMemAlloc path. wide_ptr_to_path copies it, then CoTaskMemFree releases it.
     unsafe {
         let raw = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
             .map_err(|_| "Curseor could not locate the settings directory.".to_string())?;
@@ -325,6 +333,7 @@ fn wide_ptr_to_path(raw: PWSTR) -> Result<PathBuf, String> {
     if raw.is_null() {
         return Err("Curseor could not locate the settings directory.".into());
     }
+    // SAFETY: `raw` is a NUL-terminated UTF-16 string allocated by SHGetKnownFolderPath.
     unsafe { raw.to_string() }
         .map(PathBuf::from)
         .map_err(|_| "Curseor could not locate the settings directory.".to_string())

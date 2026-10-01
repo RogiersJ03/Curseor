@@ -61,32 +61,37 @@ pub fn add(hwnd: windows::Win32::Foundation::HWND) -> Result<HICON, String> {
     data.uCallbackMessage = WM_TRAY_CALLBACK;
     data.hIcon = icon;
     fill_wide(&mut data.szTip, "Curseor");
+    // SAFETY: `data` is a live NOTIFYICONDATAW with cbSize set. NIM_DELETE ignores a
+    // missing icon. The struct is not retained.
     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
 
     let started = std::time::Instant::now();
     loop {
+        // SAFETY: `data` is the same live NOTIFYICONDATAW, now used to add the icon.
         if unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            // SAFETY: `data` is still live. NIM_SETVERSION only reads uVersion and the identity.
             if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) }.as_bool() {
                 tracing::warn!("the tray icon is using an older notification format");
             }
             return Ok(icon);
         }
         if started.elapsed() >= std::time::Duration::from_secs(2) {
+            // SAFETY: `icon` is the private icon loaded above and is not installed.
             unsafe {
                 let _ = DestroyIcon(icon);
             }
             return Err("Shell_NotifyIcon failed".into());
         }
-        unsafe {
-            windows::Win32::System::Threading::Sleep(200);
-        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
 pub fn remove(hwnd: windows::Win32::Foundation::HWND, icon: HICON) {
     let mut data = blank_data(hwnd);
     data.uFlags = NIF_GUID;
+    // SAFETY: `data` is a live NOTIFYICONDATAW identifying the icon. DestroyIcon runs
+    // only for the icon this process loaded, and only once.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &data);
         if !icon.is_invalid() {
@@ -101,6 +106,8 @@ pub fn show_balloon(hwnd: windows::Win32::Foundation::HWND) {
     data.dwInfoFlags = NIIF_INFO;
     fill_wide(&mut data.szInfoTitle, "Curseor");
     fill_wide(&mut data.szInfo, "Curseor is already running");
+    // SAFETY: `data` is a live NOTIFYICONDATAW. The info strings are NUL-terminated
+    // inside the fixed buffers. NIM_MODIFY does not retain the struct.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
     }
@@ -111,13 +118,16 @@ pub fn show_menu(
     settings: &Settings,
     paused: bool,
 ) -> Option<MenuCommand> {
+    // SAFETY: `hwnd` is the Curseor window. SetForegroundWindow only changes focus.
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
     let mut point = windows::Win32::Foundation::POINT::default();
+    // SAFETY: `point` is a live POINT. GetCursorPos writes it and keeps no pointer.
     unsafe {
         let _ = GetCursorPos(&mut point);
     }
+    // SAFETY: CreatePopupMenu allocates a menu this function destroys on every path.
     let menu = match unsafe { CreatePopupMenu() } {
         Ok(menu) => menu,
         Err(error) => {
@@ -127,11 +137,15 @@ pub fn show_menu(
     };
     if let Err(error) = fill_menu(menu, settings, paused) {
         tracing::error!("could not fill the tray menu: {error}");
+        // SAFETY: `menu` was created above and has not been attached to another menu.
         unsafe {
             let _ = DestroyMenu(menu);
         }
         return None;
     }
+    // SAFETY: `menu` is the popup just filled. `hwnd` owns the menu messages.
+    // TPM_RETURNCMD returns the id instead of sending a command. The caller's
+    // `&mut App` is not live, so the menu's message loop can borrow it.
     let selected = unsafe {
         TrackPopupMenu(
             menu,
@@ -143,6 +157,7 @@ pub fn show_menu(
             None,
         )
     };
+    // SAFETY: `menu` is the popup created above. DestroyMenu also destroys an attached submenu.
     unsafe {
         let _ = DestroyMenu(menu);
     }
@@ -192,8 +207,10 @@ fn fill_menu(menu: HMENU, settings: &Settings, paused: bool) -> Result<(), Strin
 }
 
 fn append_timeouts(menu: HMENU, settings: &Settings) -> Result<(), String> {
+    // SAFETY: the submenu is destroyed here if it is not attached, or with the parent later.
     let submenu = unsafe { CreatePopupMenu() }.map_err(|error| error.to_string())?;
     if let Err(error) = fill_timeout_items(submenu, settings) {
+        // SAFETY: `submenu` was created above and is not attached yet.
         unsafe {
             let _ = DestroyMenu(submenu);
         }
@@ -201,6 +218,8 @@ fn append_timeouts(menu: HMENU, settings: &Settings) -> Result<(), String> {
     }
     let text = wide_text("Hide after");
     // Leave the parent enabled so a disabled Curseor still shows the saved check.
+    // SAFETY: `text` is NUL-terminated and outlives the call. AppendMenuW copies it.
+    // On success the parent owns `submenu`.
     let attached = unsafe {
         AppendMenuW(
             menu,
@@ -210,6 +229,7 @@ fn append_timeouts(menu: HMENU, settings: &Settings) -> Result<(), String> {
         )
     };
     if let Err(error) = attached {
+        // SAFETY: attaching failed, so the parent does not own `submenu`.
         unsafe {
             let _ = DestroyMenu(submenu);
         }
@@ -247,11 +267,14 @@ fn append(menu: HMENU, id: u32, label: &str, checked: bool, enabled: bool) -> Re
     if !enabled {
         flags |= MF_GRAYED;
     }
+    // SAFETY: `text` is NUL-terminated and outlives the call. AppendMenuW copies it.
+    // `id` is a command id, not a handle, because the flags do not include MF_POPUP.
     unsafe { AppendMenuW(menu, flags, id as usize, PCWSTR(text.as_ptr())) }
         .map_err(|error| error.to_string())
 }
 
 fn separator(menu: HMENU) -> Result<(), String> {
+    // SAFETY: a separator has no string and no item handle. `menu` is a live popup.
     unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, None) }.map_err(|error| error.to_string())
 }
 
@@ -274,10 +297,18 @@ fn command_from_id(id: u32) -> Option<MenuCommand> {
 }
 
 fn load_private_icon() -> Result<HICON, String> {
+    // SAFETY: None asks for this process's executable module, which stays loaded.
     let module = unsafe { GetModuleHandleW(None) }.map_err(|error| error.to_string())?;
     let instance = HINSTANCE(module.0);
-    let cx = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-    let cy = unsafe { GetSystemMetrics(SM_CYSMICON) }.max(16);
+    // SAFETY: SM_CXSMICON and SM_CYSMICON are fixed metric indexes and take no pointers.
+    let (cx, cy) = unsafe {
+        (
+            GetSystemMetrics(SM_CXSMICON).max(16),
+            GetSystemMetrics(SM_CYSMICON).max(16),
+        )
+    };
+    // SAFETY: the name is MAKEINTRESOURCE(1), the icon embedded by the build script.
+    // without_provenance keeps that integer from being treated as a real allocation.
     unsafe {
         LoadImageW(
             Some(instance),
@@ -291,6 +322,7 @@ fn load_private_icon() -> Result<HICON, String> {
     }
     .map(|handle| HICON(handle.0))
     .or_else(|_| {
+        // SAFETY: a null instance plus IDI_APPLICATION loads the shared system icon.
         unsafe { LoadImageW(None, IDI_APPLICATION, IMAGE_ICON, cx, cy, LR_DEFAULTSIZE) }
             .map(|handle| HICON(handle.0))
             .map_err(|error| error.to_string())

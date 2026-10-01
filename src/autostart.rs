@@ -17,6 +17,7 @@ pub fn set(enable: bool) -> Result<(), String> {
     } else {
         delete_command(key)
     };
+    // SAFETY: `key` is the Run key opened above. RegCloseKey does not use it again.
     unsafe {
         let _ = RegCloseKey(key);
     }
@@ -26,6 +27,8 @@ pub fn set(enable: bool) -> Result<(), String> {
 fn open_run_key() -> Result<HKEY, String> {
     let subkey = wide_text(RUN_SUBKEY);
     let mut key = HKEY::default();
+    // SAFETY: `subkey` is NUL-terminated. HKEY_CURRENT_USER needs no extra rights.
+    // `key` is a live out-parameter. No security attributes are supplied.
     let error = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -54,23 +57,17 @@ fn write_command(key: HKEY) -> Result<(), String> {
     let command = format!("\"{path}\"");
     let wide = wide_text(&command);
     let name = wide_text(VALUE_NAME);
-    let error = unsafe {
-        RegSetValueExW(
-            key,
-            PCWSTR(name.as_ptr()),
-            Some(0),
-            REG_SZ,
-            Some(std::slice::from_raw_parts(
-                wide.as_ptr().cast::<u8>(),
-                wide.len() * 2,
-            )),
-        )
-    };
+    let bytes: Vec<u8> = wide.iter().flat_map(|unit| unit.to_ne_bytes()).collect();
+    // SAFETY: `name` is NUL-terminated. `bytes` is the UTF-16 value, including its
+    // trailing NUL, in native byte order. `key` is the open Run key.
+    let error =
+        unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), Some(0), REG_SZ, Some(&bytes)) };
     win32(error, "could not register Curseor to start with Windows")
 }
 
 fn delete_command(key: HKEY) -> Result<(), String> {
     let name = wide_text(VALUE_NAME);
+    // SAFETY: `name` is NUL-terminated and `key` is the open Run key.
     let error = unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) };
     if error == ERROR_FILE_NOT_FOUND {
         return Ok(());
