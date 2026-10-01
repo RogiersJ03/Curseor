@@ -73,9 +73,16 @@ pub struct App {
     /// The way-out reload already ran for this suspension. The timer must not repeat it.
     prompt_reload_attempted: bool,
     logged_prompt_failure: bool,
-    /// Hides are ignored until this instant so keys that closed a prompt cannot blank
-    /// the pointer again.
-    hide_quiet_until: Option<Instant>,
+    /// Register raw input again on a later tick. The call made as the prompt
+    /// closes can run before this thread is really receiving input.
+    reregister_input: bool,
+    /// True when the pointer was hidden as the prompt began. It is shown for the
+    /// prompt itself, then hidden again if the pointer never moved.
+    prompt_was_hidden: bool,
+    prompt_anchor: POINT,
+    /// After the prompt, cursor resets are forced back to the choice just made,
+    /// and a key that closed the prompt cannot hide a pointer that should stay shown.
+    settle_until: Option<Instant>,
     pub input_registered: bool,
     tray_added: bool,
     tray_icon: HICON,
@@ -107,7 +114,10 @@ impl App {
             prompt_pending: false,
             prompt_reload_attempted: false,
             logged_prompt_failure: false,
-            hide_quiet_until: None,
+            reregister_input: false,
+            prompt_was_hidden: false,
+            prompt_anchor: POINT { x: 0, y: 0 },
+            settle_until: None,
             input_registered: false,
             tray_added: false,
             tray_icon: HICON::default(),
@@ -159,7 +169,7 @@ impl App {
             {
                 app.kill_idle_timer();
                 false
-            } else if app.menu_open || app.quiet_active() || any_mouse_button_down() {
+            } else if app.menu_open || app.settle_active() || any_mouse_button_down() {
                 app.set_idle_timer(50);
                 false
             } else {
@@ -195,8 +205,15 @@ impl App {
                 || desktop::consent_prompt_running()
             {
                 CursorRefresh::Suspend
-            } else if app.quiet_active()
-                || !app.hidden
+            } else if app.settle_active() {
+                // The switch back can reload cursors after we have chosen. A button
+                // still reported down must not flip that choice.
+                if app.hidden {
+                    CursorRefresh::Rehide
+                } else {
+                    CursorRefresh::Reshow
+                }
+            } else if !app.hidden
                 || app
                     .last_reapply
                     .is_some_and(|instant| instant.elapsed() < Duration::from_millis(100))
@@ -218,6 +235,8 @@ impl App {
             CursorRefresh::Suspend => sync_prompt(app),
             CursorRefresh::Show => show_pointer(app),
             CursorRefresh::Blank => apply_blank(app),
+            CursorRefresh::Rehide => reassert_hidden(app),
+            CursorRefresh::Reshow => reassert_shown(app),
         }
     }
 
@@ -429,8 +448,8 @@ impl App {
         }
     }
 
-    fn quiet_active(&self) -> bool {
-        self.hide_quiet_until
+    fn settle_active(&self) -> bool {
+        self.settle_until
             .is_some_and(|instant| Instant::now() < instant)
     }
 
@@ -717,7 +736,7 @@ fn try_hide(app: *mut App) {
         return;
     }
     let hide = App::with_mut(app, |app| {
-        if app.hidden || app.menu_open || app.applying || app.quiet_active() {
+        if app.hidden || app.menu_open || app.applying || app.settle_active() {
             false
         } else {
             app.settings.enabled && !app.paused && !app.backoff_active() && !any_mouse_button_down()
@@ -734,7 +753,7 @@ fn apply_blank(app: *mut App) {
         return;
     }
     let was_hidden = App::with_mut(app, |app| {
-        if app.applying || app.prompt_pending || app.quiet_active() {
+        if app.applying || app.prompt_pending {
             None
         } else {
             app.applying = true;
@@ -801,13 +820,10 @@ fn show_pointer(app: *mut App) {
         if app.applying {
             return ShowKind::Arm;
         }
-        let on_input = desktop::thread_on_input_desktop();
-        let consent = desktop::consent_prompt_running();
-        if app.prompt_pending && on_input && !consent {
-            app.applying = true;
-            return ShowKind::Finish;
-        }
-        if !on_input || consent {
+        // Off the input desktop there is nothing to show. On it, movement always
+        // shows a hidden pointer. That must not take the prompt-close path, which
+        // hides again when the position has not caught up yet.
+        if !desktop::thread_on_input_desktop() {
             return ShowKind::Hold;
         }
         if app.hidden {
@@ -818,7 +834,6 @@ fn show_pointer(app: *mut App) {
     });
     match kind {
         ShowKind::Hold => sync_prompt(app),
-        ShowKind::Finish => finish_return(app),
         ShowKind::Show => show_on_input_desktop(app),
         ShowKind::Arm => App::with_mut(app, |app| app.arm_idle_timer()),
     }
@@ -830,18 +845,22 @@ fn show_on_input_desktop(app: *mut App) {
         app.applying = false;
         let on_input = desktop::thread_on_input_desktop();
         let consent = desktop::consent_prompt_running();
-        if restored && on_input && consent {
+        if restored && on_input {
             cursor::delete_marker();
             app.hidden = false;
-            if !app.prompt_pending {
-                tracing::info!("suspended hiding for a consent prompt");
+            if consent {
+                if !app.prompt_pending {
+                    app.prompt_was_hidden = false;
+                    tracing::info!("suspended hiding for a consent prompt");
+                }
+                app.prompt_pending = true;
+                tracing::info!("pointer shown for a consent prompt");
+            } else {
+                clear_prompt(app);
+                tracing::info!("pointer shown");
             }
-            app.prompt_pending = true;
-            tracing::info!("pointer shown for a consent prompt");
-        } else if restored && on_input {
-            cursor::delete_marker();
-            app.hidden = false;
-            tracing::info!("pointer shown");
+            app.last_activity = Instant::now();
+            app.capture_position();
         } else {
             tracing::error!("could not restore the pointer");
         }
@@ -897,19 +916,28 @@ enum CursorRefresh {
     Suspend,
     Show,
     Blank,
+    Rehide,
+    Reshow,
 }
 
 enum ShowKind {
     Arm,
     Hold,
     Show,
-    Finish,
 }
 
 enum PromptPhase {
     Idle,
     Entry { on_input: bool },
     Finish,
+    ShowMoved,
+    Reregister,
+}
+
+enum ReturnAction {
+    Wait,
+    Hide,
+    Show,
 }
 
 fn sync_prompt(app: *mut App) {
@@ -924,6 +952,8 @@ fn sync_prompt(app: *mut App) {
             if !app.prompt_pending {
                 app.prompt_pending = true;
                 app.logged_prompt_failure = false;
+                app.prompt_was_hidden = app.hidden || cursor::marker_exists();
+                app.prompt_anchor = pointer_position().unwrap_or(app.last_counted);
                 tracing::info!("suspended hiding for a consent prompt");
             }
             app.kill_idle_timer();
@@ -941,6 +971,21 @@ fn sync_prompt(app: *mut App) {
         } else if app.prompt_pending {
             app.applying = true;
             PromptPhase::Finish
+        } else if app.hidden
+            && pointer_position().is_some_and(|position| {
+                moved_enough(
+                    app.last_counted,
+                    position,
+                    app.settings.movement_threshold_px,
+                )
+            })
+        {
+            // Raw input can stop across the desktop switch. The pointer position
+            // still changes, so a hidden pointer is shown from here too.
+            PromptPhase::ShowMoved
+        } else if app.reregister_input {
+            app.update_desktop_timer();
+            PromptPhase::Reregister
         } else {
             app.update_desktop_timer();
             PromptPhase::Idle
@@ -950,6 +995,8 @@ fn sync_prompt(app: *mut App) {
         PromptPhase::Idle => {}
         PromptPhase::Entry { on_input } => finish_entry(app, on_input),
         PromptPhase::Finish => finish_return(app),
+        PromptPhase::ShowMoved => show_pointer(app),
+        PromptPhase::Reregister => reregister_after_prompt(app),
     }
 }
 
@@ -974,28 +1021,86 @@ fn finish_entry(app: *mut App, on_input: bool) {
 }
 
 fn finish_return(app: *mut App) {
+    let action = App::with_mut(app, |app| {
+        let back = desktop::thread_on_input_desktop() && !desktop::consent_prompt_running();
+        if !back {
+            app.applying = false;
+            app.update_desktop_timer();
+            return ReturnAction::Wait;
+        }
+        // Closing the prompt is not pointer activity. A pointer that was already
+        // hidden stays hidden until it actually moves.
+        let moved = pointer_position().is_some_and(|position| {
+            moved_enough(
+                app.prompt_anchor,
+                position,
+                app.settings.movement_threshold_px,
+            )
+        });
+        if app.prompt_was_hidden && !moved {
+            ReturnAction::Hide
+        } else {
+            ReturnAction::Show
+        }
+    });
+    match action {
+        ReturnAction::Wait => {}
+        ReturnAction::Hide => finish_return_hide(app),
+        ReturnAction::Show => finish_return_show(app),
+    }
+}
+
+fn finish_return_hide(app: *mut App) {
+    let result = cursor::hide_system_cursors(true);
+    let hwnd = App::with_mut(app, |app| {
+        app.applying = false;
+        if !prompt_is_over() {
+            app.update_desktop_timer();
+            return None;
+        }
+        match result {
+            Ok(_) => {
+                app.hidden = true;
+                clear_prompt(app);
+                app.settle_until = Some(Instant::now() + HIDE_QUIET);
+                app.reregister_input = true;
+                app.kill_idle_timer();
+                app.update_desktop_timer();
+                tracing::info!("pointer hidden after a consent prompt");
+                Some(app.hwnd)
+            }
+            Err(error) => {
+                app.hidden = true;
+                log_prompt_failure(
+                    app,
+                    &format!("could not hide the pointer after a consent prompt: {error}"),
+                );
+                app.update_desktop_timer();
+                None
+            }
+        }
+    });
+    reregister_input(hwnd);
+}
+
+fn finish_return_show(app: *mut App) {
     let restored = cursor::reload_system_cursors();
     let hwnd = App::with_mut(app, |app| {
         app.applying = false;
-        let back = desktop::thread_on_input_desktop() && !desktop::consent_prompt_running();
-        if !back {
+        if !prompt_is_over() {
             app.update_desktop_timer();
             return None;
         }
         if !restored {
-            if !app.logged_prompt_failure {
-                app.logged_prompt_failure = true;
-                tracing::error!("could not restore the pointer after a consent prompt");
-            }
+            log_prompt_failure(app, "could not restore the pointer after a consent prompt");
             app.update_desktop_timer();
             return None;
         }
         cursor::delete_marker();
         app.hidden = false;
-        app.prompt_pending = false;
-        app.prompt_reload_attempted = false;
-        app.logged_prompt_failure = false;
-        app.hide_quiet_until = Some(Instant::now() + HIDE_QUIET);
+        clear_prompt(app);
+        app.settle_until = Some(Instant::now() + HIDE_QUIET);
+        app.reregister_input = true;
         app.last_activity = Instant::now();
         app.capture_position();
         tracing::info!("pointer restored after a consent prompt");
@@ -1003,13 +1108,91 @@ fn finish_return(app: *mut App) {
         app.update_desktop_timer();
         Some(app.hwnd)
     });
-    if let Some(hwnd) = hwnd {
-        if hwnd.is_invalid() {
-            return;
+    reregister_input(hwnd);
+}
+
+fn reassert_hidden(app: *mut App) {
+    let go = App::with_mut(app, |app| {
+        if app.applying {
+            false
+        } else {
+            app.applying = true;
+            true
         }
-        if let Err(error) = input::register(hwnd) {
-            tracing::error!("could not register raw input after a consent prompt: {error}");
+    });
+    if !go {
+        return;
+    }
+    let result = cursor::hide_system_cursors(true);
+    App::with_mut(app, |app| {
+        app.applying = false;
+        if result.is_ok() {
+            app.hidden = true;
+            app.kill_idle_timer();
         }
+        app.update_desktop_timer();
+    });
+}
+
+fn reassert_shown(app: *mut App) {
+    let go = App::with_mut(app, |app| {
+        if app.applying {
+            false
+        } else {
+            app.applying = true;
+            true
+        }
+    });
+    if !go {
+        return;
+    }
+    let restored = cursor::reload_system_cursors();
+    App::with_mut(app, |app| {
+        app.applying = false;
+        if restored && prompt_is_over() {
+            cursor::delete_marker();
+            app.hidden = false;
+            app.arm_idle_timer();
+        }
+        app.update_desktop_timer();
+    });
+}
+
+fn prompt_is_over() -> bool {
+    desktop::thread_on_input_desktop() && !desktop::consent_prompt_running()
+}
+
+fn clear_prompt(app: &mut App) {
+    app.prompt_pending = false;
+    app.prompt_reload_attempted = false;
+    app.logged_prompt_failure = false;
+}
+
+fn log_prompt_failure(app: &mut App, message: &str) {
+    if app.logged_prompt_failure {
+        return;
+    }
+    app.logged_prompt_failure = true;
+    tracing::error!("{message}");
+}
+
+fn reregister_after_prompt(app: *mut App) {
+    let hwnd = App::with_mut(app, |app| {
+        app.reregister_input = false;
+        app.hwnd
+    });
+    reregister_input(Some(hwnd));
+}
+
+fn reregister_input(hwnd: Option<HWND>) {
+    let Some(hwnd) = hwnd else {
+        return;
+    };
+    if hwnd.is_invalid() {
+        return;
+    }
+    if let Err(error) = input::register(hwnd) {
+        tracing::error!("could not register raw input after a consent prompt: {error}");
     }
 }
 
