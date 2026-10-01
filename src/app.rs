@@ -13,12 +13,16 @@ pub const WM_APP_SHOW_MENU: u32 = WM_APP + 4;
 use crate::autostart;
 use crate::config::{self, Settings};
 use crate::cursor;
+use crate::desktop;
 use crate::input::{self, InputEvents, any_mouse_button_down, moved_enough, pointer_position};
 use crate::tray::{self, MenuCommand};
 
 const IDLE_TIMER_ID: usize = 1;
 pub(crate) const POINTER_TIMER_ID: usize = 2;
+pub(crate) const DESKTOP_TIMER_ID: usize = 3;
+const DESKTOP_TIMER_MS: u32 = 200;
 const BACKOFF: Duration = Duration::from_secs(2);
+const HIDE_QUIET: Duration = Duration::from_millis(500);
 
 thread_local! {
     /// True while an `&mut App` exists. The window procedure must not form another one.
@@ -62,6 +66,16 @@ pub struct App {
     told_restore_failure: bool,
     logged_best_effort: bool,
     timer_armed: bool,
+    desktop_timer_armed: bool,
+    /// Set while the secure desktop or consent.exe is up, until a reload succeeds
+    /// back on the input desktop with consent.exe gone.
+    prompt_pending: bool,
+    /// The way-out reload already ran for this suspension. The timer must not repeat it.
+    prompt_reload_attempted: bool,
+    logged_prompt_failure: bool,
+    /// Hides are ignored until this instant so keys that closed a prompt cannot blank
+    /// the pointer again.
+    hide_quiet_until: Option<Instant>,
     pub input_registered: bool,
     tray_added: bool,
     tray_icon: HICON,
@@ -89,6 +103,11 @@ impl App {
             told_restore_failure: false,
             logged_best_effort: false,
             timer_armed: false,
+            desktop_timer_armed: false,
+            prompt_pending: false,
+            prompt_reload_attempted: false,
+            logged_prompt_failure: false,
+            hide_quiet_until: None,
             input_registered: false,
             tray_added: false,
             tray_icon: HICON::default(),
@@ -132,10 +151,15 @@ impl App {
 
     pub(crate) fn on_timer(app: *mut App) {
         let hide = Self::with_mut(app, |app| {
-            if app.hidden || !app.settings.enabled || app.paused || !app.settings.hide_on_idle {
+            if app.hidden
+                || app.prompt_pending
+                || !app.settings.enabled
+                || app.paused
+                || !app.settings.hide_on_idle
+            {
                 app.kill_idle_timer();
                 false
-            } else if app.menu_open || any_mouse_button_down() {
+            } else if app.menu_open || app.quiet_active() || any_mouse_button_down() {
                 app.set_idle_timer(50);
                 false
             } else {
@@ -158,9 +182,20 @@ impl App {
         self.arm_idle_timer();
     }
 
+    pub(crate) fn on_prompt_check(app: *mut App) {
+        sync_prompt(app);
+    }
+
     pub(crate) fn on_cursor_environment_changed(app: *mut App) {
         let next = Self::with_mut(app, |app| {
-            if app.applying
+            if app.applying {
+                CursorRefresh::Ignore
+            } else if app.prompt_pending
+                || !desktop::thread_on_input_desktop()
+                || desktop::consent_prompt_running()
+            {
+                CursorRefresh::Suspend
+            } else if app.quiet_active()
                 || !app.hidden
                 || app
                     .last_reapply
@@ -180,6 +215,7 @@ impl App {
         });
         match next {
             CursorRefresh::Ignore => {}
+            CursorRefresh::Suspend => sync_prompt(app),
             CursorRefresh::Show => show_pointer(app),
             CursorRefresh::Blank => apply_blank(app),
         }
@@ -300,7 +336,11 @@ impl App {
     }
 
     pub(crate) fn shutdown(app: *mut App, tell_user: bool) {
-        Self::with_mut(app, |app| app.kill_idle_timer());
+        desktop::uninstall_hook();
+        Self::with_mut(app, |app| {
+            app.kill_idle_timer();
+            app.kill_desktop_timer();
+        });
         restore_for_exit(app, tell_user);
         Self::with_mut(app, |app| app.remove_tray());
         let registered = Self::with_mut(app, |app| app.input_registered);
@@ -313,6 +353,7 @@ impl App {
     pub fn arm_idle_timer(&mut self) {
         if self.menu_open
             || self.hidden
+            || self.prompt_pending
             || !self.settings.enabled
             || self.paused
             || !self.settings.hide_on_idle
@@ -351,6 +392,46 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), IDLE_TIMER_ID);
         }
         self.timer_armed = false;
+    }
+
+    fn arm_desktop_timer(&mut self) {
+        if self.hwnd.is_invalid() {
+            return;
+        }
+        // SAFETY: `hwnd` is the Curseor window. The timer id belongs to this process.
+        // A null timer procedure posts WM_TIMER instead of calling back into Rust.
+        let armed = unsafe { SetTimer(Some(self.hwnd), DESKTOP_TIMER_ID, DESKTOP_TIMER_MS, None) };
+        if armed == 0 {
+            tracing::error!("could not arm the desktop timer");
+            self.desktop_timer_armed = false;
+            return;
+        }
+        self.desktop_timer_armed = true;
+    }
+
+    fn kill_desktop_timer(&mut self) {
+        if !self.desktop_timer_armed || self.hwnd.is_invalid() {
+            return;
+        }
+        // SAFETY: `hwnd` is the Curseor window and DESKTOP_TIMER_ID is the timer armed above.
+        // KillTimer does not call the window procedure.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), DESKTOP_TIMER_ID);
+        }
+        self.desktop_timer_armed = false;
+    }
+
+    fn update_desktop_timer(&mut self) {
+        if self.hidden || self.prompt_pending {
+            self.arm_desktop_timer();
+        } else {
+            self.kill_desktop_timer();
+        }
+    }
+
+    fn quiet_active(&self) -> bool {
+        self.hide_quiet_until
+            .is_some_and(|instant| Instant::now() < instant)
     }
 
     fn remove_tray(&mut self) {
@@ -616,11 +697,11 @@ fn sample_pointer(app: *mut App) -> bool {
 }
 
 fn note_pointer_activity(app: *mut App) {
-    let hidden = App::with_mut(app, |app| {
+    let restore = App::with_mut(app, |app| {
         app.last_activity = Instant::now();
-        app.hidden
+        app.hidden || app.prompt_pending
     });
-    if hidden {
+    if restore {
         show_pointer(app);
     } else {
         App::with_mut(app, |app| app.arm_idle_timer());
@@ -628,8 +709,15 @@ fn note_pointer_activity(app: *mut App) {
 }
 
 fn try_hide(app: *mut App) {
+    let away = !desktop::thread_on_input_desktop()
+        || desktop::consent_prompt_running()
+        || App::with_mut(app, |app| app.prompt_pending);
+    if away {
+        sync_prompt(app);
+        return;
+    }
     let hide = App::with_mut(app, |app| {
-        if app.hidden || app.menu_open || app.applying {
+        if app.hidden || app.menu_open || app.applying || app.quiet_active() {
             false
         } else {
             app.settings.enabled && !app.paused && !app.backoff_active() && !any_mouse_button_down()
@@ -641,8 +729,12 @@ fn try_hide(app: *mut App) {
 }
 
 fn apply_blank(app: *mut App) {
+    if !desktop::thread_on_input_desktop() || desktop::consent_prompt_running() {
+        sync_prompt(app);
+        return;
+    }
     let was_hidden = App::with_mut(app, |app| {
-        if app.applying {
+        if app.applying || app.prompt_pending || app.quiet_active() {
             None
         } else {
             app.applying = true;
@@ -652,7 +744,7 @@ fn apply_blank(app: *mut App) {
     let Some(was_hidden) = was_hidden else {
         return;
     };
-    let result = cursor::hide_system_cursors();
+    let result = cursor::hide_system_cursors(was_hidden);
     let busy = App::with_mut(app, |app| {
         let busy = app.pointer_busy();
         app.applying = false;
@@ -669,6 +761,7 @@ fn apply_blank(app: *mut App) {
                     );
                 }
                 app.hidden = true;
+                app.update_desktop_timer();
             });
             if busy {
                 App::with_mut(app, |app| {
@@ -680,39 +773,81 @@ fn apply_blank(app: *mut App) {
             }
             App::with_mut(app, |app| {
                 app.kill_idle_timer();
+                app.update_desktop_timer();
                 if !was_hidden {
                     tracing::info!("pointer hidden");
                 }
             });
         }
         Err(error) => {
+            let restored = matches!(error, cursor::HideError::Required { restored: true, .. });
             App::with_mut(app, |app| {
-                app.hidden = false;
+                // A failed re-apply leaves the earlier blank cursors in place.
+                // Clearing `hidden` here would make movement and Pause skip the restore.
+                if restored || !was_hidden {
+                    app.hidden = false;
+                }
                 app.begin_backoff();
                 tracing::error!("could not hide the pointer: {error}");
                 app.arm_idle_timer();
+                app.update_desktop_timer();
             });
         }
     }
 }
 
 fn show_pointer(app: *mut App) {
-    let hidden = App::with_mut(app, |app| app.hidden);
-    if hidden {
-        App::with_mut(app, |app| app.applying = true);
-        let restored = cursor::reload_system_cursors();
-        App::with_mut(app, |app| {
-            app.applying = false;
-            if restored {
-                cursor::delete_marker();
-                app.hidden = false;
-                tracing::info!("pointer shown");
-            } else {
-                tracing::error!("could not restore the pointer");
-            }
-        });
+    let kind = App::with_mut(app, |app| {
+        if app.applying {
+            return ShowKind::Arm;
+        }
+        let on_input = desktop::thread_on_input_desktop();
+        let consent = desktop::consent_prompt_running();
+        if app.prompt_pending && on_input && !consent {
+            app.applying = true;
+            return ShowKind::Finish;
+        }
+        if !on_input || consent {
+            return ShowKind::Hold;
+        }
+        if app.hidden {
+            app.applying = true;
+            return ShowKind::Show;
+        }
+        ShowKind::Arm
+    });
+    match kind {
+        ShowKind::Hold => sync_prompt(app),
+        ShowKind::Finish => finish_return(app),
+        ShowKind::Show => show_on_input_desktop(app),
+        ShowKind::Arm => App::with_mut(app, |app| app.arm_idle_timer()),
     }
-    App::with_mut(app, |app| app.arm_idle_timer());
+}
+
+fn show_on_input_desktop(app: *mut App) {
+    let restored = cursor::reload_system_cursors();
+    App::with_mut(app, |app| {
+        app.applying = false;
+        let on_input = desktop::thread_on_input_desktop();
+        let consent = desktop::consent_prompt_running();
+        if restored && on_input && consent {
+            cursor::delete_marker();
+            app.hidden = false;
+            if !app.prompt_pending {
+                tracing::info!("suspended hiding for a consent prompt");
+            }
+            app.prompt_pending = true;
+            tracing::info!("pointer shown for a consent prompt");
+        } else if restored && on_input {
+            cursor::delete_marker();
+            app.hidden = false;
+            tracing::info!("pointer shown");
+        } else {
+            tracing::error!("could not restore the pointer");
+        }
+        app.arm_idle_timer();
+        app.update_desktop_timer();
+    });
 }
 
 fn restore_for_exit(app: *mut App, tell_user: bool) {
@@ -759,8 +894,123 @@ fn quit(app: *mut App) {
 
 enum CursorRefresh {
     Ignore,
+    Suspend,
     Show,
     Blank,
+}
+
+enum ShowKind {
+    Arm,
+    Hold,
+    Show,
+    Finish,
+}
+
+enum PromptPhase {
+    Idle,
+    Entry { on_input: bool },
+    Finish,
+}
+
+fn sync_prompt(app: *mut App) {
+    let phase = App::with_mut(app, |app| {
+        if app.applying {
+            return PromptPhase::Idle;
+        }
+        let on_input = desktop::thread_on_input_desktop();
+        let consent = desktop::consent_prompt_running();
+        let away = !on_input || consent;
+        if away {
+            if !app.prompt_pending {
+                app.prompt_pending = true;
+                app.logged_prompt_failure = false;
+                tracing::info!("suspended hiding for a consent prompt");
+            }
+            app.kill_idle_timer();
+            let reload = !app.prompt_reload_attempted && (app.hidden || cursor::marker_exists());
+            if reload {
+                app.prompt_reload_attempted = true;
+                app.applying = true;
+            }
+            app.update_desktop_timer();
+            if reload {
+                PromptPhase::Entry { on_input }
+            } else {
+                PromptPhase::Idle
+            }
+        } else if app.prompt_pending {
+            app.applying = true;
+            PromptPhase::Finish
+        } else {
+            app.update_desktop_timer();
+            PromptPhase::Idle
+        }
+    });
+    match phase {
+        PromptPhase::Idle => {}
+        PromptPhase::Entry { on_input } => finish_entry(app, on_input),
+        PromptPhase::Finish => finish_return(app),
+    }
+}
+
+fn finish_entry(app: *mut App, on_input: bool) {
+    let restored = cursor::reload_system_cursors();
+    App::with_mut(app, |app| {
+        app.applying = false;
+        // A reload from off the input desktop can report success without the
+        // secure desktop, or the desktop we return to, actually showing it.
+        let trusted = restored && on_input && desktop::thread_on_input_desktop();
+        if trusted {
+            cursor::delete_marker();
+            app.hidden = false;
+            tracing::info!("pointer shown for a consent prompt");
+        } else if !restored && !app.logged_prompt_failure {
+            app.logged_prompt_failure = true;
+            tracing::error!("could not restore the pointer for a consent prompt");
+        }
+        app.kill_idle_timer();
+        app.update_desktop_timer();
+    });
+}
+
+fn finish_return(app: *mut App) {
+    let restored = cursor::reload_system_cursors();
+    let hwnd = App::with_mut(app, |app| {
+        app.applying = false;
+        let back = desktop::thread_on_input_desktop() && !desktop::consent_prompt_running();
+        if !back {
+            app.update_desktop_timer();
+            return None;
+        }
+        if !restored {
+            if !app.logged_prompt_failure {
+                app.logged_prompt_failure = true;
+                tracing::error!("could not restore the pointer after a consent prompt");
+            }
+            app.update_desktop_timer();
+            return None;
+        }
+        cursor::delete_marker();
+        app.hidden = false;
+        app.prompt_pending = false;
+        app.prompt_reload_attempted = false;
+        app.logged_prompt_failure = false;
+        app.hide_quiet_until = Some(Instant::now() + HIDE_QUIET);
+        app.last_activity = Instant::now();
+        app.capture_position();
+        tracing::info!("pointer restored after a consent prompt");
+        app.arm_idle_timer();
+        app.update_desktop_timer();
+        Some(app.hwnd)
+    });
+    if let Some(hwnd) = hwnd {
+        if hwnd.is_invalid() {
+            return;
+        }
+        if let Err(error) = input::register(hwnd) {
+            tracing::error!("could not register raw input after a consent prompt: {error}");
+        }
+    }
 }
 
 fn duration_ms(duration: Duration) -> u32 {

@@ -98,7 +98,12 @@ pub struct HideSuccess {
 pub enum HideError {
     Marker(String),
     Blank(String),
-    Required { name: &'static str, error: String },
+    Required {
+        name: &'static str,
+        error: String,
+        /// True when this attempt put the user's cursors back.
+        restored: bool,
+    },
 }
 
 impl std::fmt::Display for HideError {
@@ -106,7 +111,7 @@ impl std::fmt::Display for HideError {
         match self {
             Self::Marker(error) => write!(formatter, "could not write the marker: {error}"),
             Self::Blank(error) => write!(formatter, "could not create a blank cursor: {error}"),
-            Self::Required { name, error } => write!(formatter, "{name}: {error}"),
+            Self::Required { name, error, .. } => write!(formatter, "{name}: {error}"),
         }
     }
 }
@@ -132,12 +137,16 @@ pub fn repair_if_unclean() {
     }
 }
 
-pub fn hide_system_cursors() -> Result<HideSuccess, HideError> {
+pub fn hide_system_cursors(already_hidden: bool) -> Result<HideSuccess, HideError> {
     write_marker().map_err(HideError::Marker)?;
     let template = match create_blank() {
         Ok(cursor) => cursor,
         Err(error) => {
-            delete_marker();
+            // A re-apply has not replaced anything yet. The earlier blank cursors
+            // are still installed, so the marker has to stay for the next start.
+            if !already_hidden {
+                delete_marker();
+            }
             return Err(HideError::Blank(error));
         }
     };
@@ -147,13 +156,15 @@ pub fn hide_system_cursors() -> Result<HideSuccess, HideError> {
         match replace_one(template, cursor.id) {
             Ok(()) => {}
             Err(error) if cursor.required => {
-                if reload_system_cursors() {
+                let restored = reload_system_cursors();
+                if restored {
                     delete_marker();
                 }
                 destroy_cursor(template);
                 return Err(HideError::Required {
                     name: cursor.name,
                     error,
+                    restored,
                 });
             }
             Err(error) => best_effort_failures.push((cursor.name, error)),
@@ -178,6 +189,10 @@ pub fn reload_system_cursors() -> bool {
         )
         .is_ok()
     }
+}
+
+pub fn marker_exists() -> bool {
+    marker_path().is_some_and(|path| path.is_file())
 }
 
 pub fn delete_marker() {
