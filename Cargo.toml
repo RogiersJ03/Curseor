@@ -1,6 +1,6 @@
 [package]
 name = "curseor"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Hide the Windows pointer while typing and when it is idle."
 publish = false
