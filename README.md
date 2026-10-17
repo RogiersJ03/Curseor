@@ -16,7 +16,7 @@ The default settings file is `%APPDATA%\Curseor\config.toml`. If `%USERPROFILE%\
 
 ## Tray
 
-The tray menu can enable Curseor, pause it, hide while typing, hide when idle, choose how long to wait, start with Windows, open the settings file, or quit. Pause lasts only until quit or sign-out and is not written to the settings file. Enabled is the switch that is saved. Windows may keep the icon in the tray overflow; Win+B focuses the notification area when the pointer is hidden.
+The tray menu can enable Curseor, pause it, hide while typing, hide when idle, show on scroll, choose how long to wait, start with Windows, open the settings file, or quit. Pause lasts only until quit or sign-out and is not written to the settings file. Enabled is the switch that is saved. Windows may keep the icon in the tray overflow; Win+B focuses the notification area when the pointer is hidden.
 
 ## Limits
 

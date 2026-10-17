@@ -155,7 +155,15 @@ impl App {
     }
 
     pub(crate) fn handle_input(app: *mut App, event: InputEvents) {
-        if event.button || event.wheel {
+        // A shown pointer, and one being shown for a system prompt, still treat the
+        // wheel as activity. show_on_scroll is what brings an intentionally hidden
+        // pointer back. blank_installed stays true while it is hidden, so that flag
+        // is not part of this check.
+        let wheel_reveals = event.wheel
+            && Self::with_mut(app, |app| {
+                app.settings.show_on_scroll || app.prompt_pending || !app.hidden
+            });
+        if event.button || wheel_reveals {
             Self::with_mut(app, |app| app.capture_position());
             note_pointer_activity(app);
         }
@@ -524,6 +532,10 @@ fn apply_command(app: *mut App, command: MenuCommand) {
             let value = App::with_mut(app, |app| !app.settings.hide_on_idle);
             persist_bool(app, "hide_on_idle", value);
         }
+        MenuCommand::ToggleScroll => {
+            let value = App::with_mut(app, |app| !app.settings.show_on_scroll);
+            persist_bool(app, "show_on_scroll", value);
+        }
         MenuCommand::SetTimeout(milliseconds) => persist_timeout(app, milliseconds),
         MenuCommand::ToggleStartup => {
             let value = App::with_mut(app, |app| !app.settings.start_with_windows);
@@ -551,6 +563,10 @@ fn persist_bool(app: *mut App, key: &str, value: bool) {
             }
             "hide_on_idle" => {
                 new_settings.hide_on_idle = value;
+                true
+            }
+            "show_on_scroll" => {
+                new_settings.show_on_scroll = value;
                 true
             }
             "show_tray" => {
