@@ -36,6 +36,9 @@ const TEMPLATE: &str = "\
 enabled = true
 hide_on_keyboard = true
 hide_on_idle = true
+# Scrolling does not bring a hidden pointer back unless this is true.
+# Moving the pointer still does.
+show_on_scroll = false
 idle_timeout_ms = 3000
 show_tray = true
 start_with_windows = false
@@ -47,6 +50,7 @@ pub struct Settings {
     pub enabled: bool,
     pub hide_on_keyboard: bool,
     pub hide_on_idle: bool,
+    pub show_on_scroll: bool,
     pub idle_timeout_ms: u64,
     pub show_tray: bool,
     pub start_with_windows: bool,
@@ -59,6 +63,7 @@ impl Default for Settings {
             enabled: true,
             hide_on_keyboard: true,
             hide_on_idle: true,
+            show_on_scroll: false,
             idle_timeout_ms: 3000,
             show_tray: true,
             start_with_windows: false,
@@ -129,6 +134,7 @@ pub fn load(path: &Path) -> Result<Settings, String> {
         enabled: bool_key(&document, "enabled", defaults.enabled)?,
         hide_on_keyboard: bool_key(&document, "hide_on_keyboard", defaults.hide_on_keyboard)?,
         hide_on_idle: bool_key(&document, "hide_on_idle", defaults.hide_on_idle)?,
+        show_on_scroll: bool_key(&document, "show_on_scroll", defaults.show_on_scroll)?,
         idle_timeout_ms: timeout_key(&document, defaults.idle_timeout_ms)?,
         show_tray: bool_key(&document, "show_tray", defaults.show_tray)?,
         start_with_windows: bool_key(&document, "start_with_windows", defaults.start_with_windows)?,

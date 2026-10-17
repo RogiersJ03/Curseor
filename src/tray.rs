@@ -30,6 +30,7 @@ const CMD_IDLE: u32 = 4;
 const CMD_STARTUP: u32 = 5;
 const CMD_OPEN: u32 = 6;
 const CMD_QUIT: u32 = 7;
+const CMD_SCROLL: u32 = 8;
 const CMD_TIMEOUT_BASE: u32 = 100;
 
 const PRESETS: [(u64, &str); 7] = [
@@ -48,6 +49,7 @@ pub enum MenuCommand {
     TogglePause,
     ToggleKeyboard,
     ToggleIdle,
+    ToggleScroll,
     SetTimeout(u64),
     ToggleStartup,
     OpenSettings,
@@ -191,6 +193,13 @@ fn fill_menu(menu: HMENU, settings: &Settings, paused: bool) -> Result<(), Strin
         settings.hide_on_idle,
         hide_enabled,
     )?;
+    append(
+        menu,
+        CMD_SCROLL,
+        "Show on scroll",
+        settings.show_on_scroll,
+        hide_enabled,
+    )?;
     append_timeouts(menu, settings)?;
     separator(menu)?;
     append(
@@ -284,6 +293,7 @@ fn command_from_id(id: u32) -> Option<MenuCommand> {
         CMD_PAUSE => Some(MenuCommand::TogglePause),
         CMD_KEYBOARD => Some(MenuCommand::ToggleKeyboard),
         CMD_IDLE => Some(MenuCommand::ToggleIdle),
+        CMD_SCROLL => Some(MenuCommand::ToggleScroll),
         CMD_STARTUP => Some(MenuCommand::ToggleStartup),
         CMD_OPEN => Some(MenuCommand::OpenSettings),
         CMD_QUIT => Some(MenuCommand::Quit),

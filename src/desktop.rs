@@ -11,7 +11,8 @@ use windows::Win32::System::StationsAndDesktops::{
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_DESKTOPSWITCH, PostMessageW, WINEVENT_OUTOFCONTEXT, WM_APP,
+    EVENT_SYSTEM_DESKTOPSWITCH, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+    PostMessageW, WINEVENT_OUTOFCONTEXT, WM_APP,
 };
 use windows::core::BOOL;
 
@@ -115,11 +116,16 @@ pub fn thread_on_input_desktop() -> bool {
     }
 }
 
-/// Whether the admin consent process is running in this session.
+/// Whether a system dialog that needs the real pointer is up.
 ///
-/// It runs for a dimmed secure-desktop prompt and for a consent dialog left on
-/// the normal desktop, and it exits when the prompt closes.
-pub fn consent_prompt_running() -> bool {
+/// Admin consent, the Windows folder picker, and a standard dialog (the kind
+/// Claude uses to ask for folder access) all qualify. A background broker
+/// process does not, unless it is the foreground window.
+pub fn blocking_prompt() -> bool {
+    if foreground_is_dialog() {
+        return true;
+    }
+    let foreground = foreground_process_id();
     // SAFETY: TH32CS_SNAPPROCESS takes no buffer. The snapshot handle is closed
     // below. `entry` is a live PROCESSENTRY32W whose dwSize is the struct size.
     // Process32 writes into that struct and does not keep the pointer.
@@ -138,7 +144,7 @@ pub fn consent_prompt_running() -> bool {
     let started = unsafe { Process32FirstW(snapshot, &mut entry) };
     if started.is_ok() {
         loop {
-            if exe_is_consent(&entry.szExeFile) {
+            if process_blocks_prompt(&entry, foreground) {
                 found = true;
                 break;
             }
@@ -155,18 +161,63 @@ pub fn consent_prompt_running() -> bool {
     found
 }
 
+fn foreground_is_dialog() -> bool {
+    // SAFETY: GetForegroundWindow takes no pointer. GetClassNameW writes the class
+    // into `name`, which lives for this call, and does not keep the buffer.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut name = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut name);
+        if length <= 0 {
+            return false;
+        }
+        let class = String::from_utf16_lossy(&name[..length as usize]);
+        // #32770 is the class of a standard Win32 dialog, including the folder
+        // permission and file dialogs apps show on this desktop.
+        class == "#32770"
+    }
+}
+
+fn foreground_process_id() -> u32 {
+    // SAFETY: GetForegroundWindow takes no pointer. The process id is a live
+    // out-parameter and is not retained.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return 0;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid
+    }
+}
+
+fn process_blocks_prompt(entry: &PROCESSENTRY32W, foreground: u32) -> bool {
+    let name = exe_name(&entry.szExeFile);
+    if name.eq_ignore_ascii_case("consent.exe") || name.eq_ignore_ascii_case("pickerhost.exe") {
+        return true;
+    }
+    // This broker stays running after its dialog closes. Only the foreground
+    // instance is a prompt.
+    foreground != 0
+        && entry.th32ProcessID == foreground
+        && name.eq_ignore_ascii_case("credentialuibroker.exe")
+}
+
+fn exe_name(name: &[u16; 260]) -> String {
+    let end = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..end])
+}
+
 fn log_snapshot_once() {
     let already = LOGGED_SNAPSHOT.with(|logged| logged.replace(true));
     if !already {
         tracing::error!("could not list processes for a consent prompt");
     }
-}
-
-fn exe_is_consent(name: &[u16; 260]) -> bool {
-    let end = name
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(name.len());
-    let text = String::from_utf16_lossy(&name[..end]);
-    text.eq_ignore_ascii_case("consent.exe")
 }

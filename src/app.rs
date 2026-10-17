@@ -83,6 +83,12 @@ pub struct App {
     /// After the prompt, cursor resets are forced back to the choice just made,
     /// and a key that closed the prompt cannot hide a pointer that should stay shown.
     settle_until: Option<Instant>,
+    /// A cursor reset arrived while the pointer was supposed to be shown. The next
+    /// move reloads the system cursors, because that reset can put the blank pointer back.
+    show_on_next_move: bool,
+    /// Blank system cursors are installed, or were installed and a dialog may have
+    /// put them back after a show.
+    blank_installed: bool,
     pub input_registered: bool,
     tray_added: bool,
     tray_icon: HICON,
@@ -118,6 +124,8 @@ impl App {
             prompt_was_hidden: false,
             prompt_anchor: POINT { x: 0, y: 0 },
             settle_until: None,
+            show_on_next_move: false,
+            blank_installed: false,
             input_registered: false,
             tray_added: false,
             tray_icon: HICON::default(),
@@ -147,7 +155,15 @@ impl App {
     }
 
     pub(crate) fn handle_input(app: *mut App, event: InputEvents) {
-        if event.button || event.wheel {
+        // A shown pointer, and one being shown for a system prompt, still treat the
+        // wheel as activity. show_on_scroll is what brings an intentionally hidden
+        // pointer back. blank_installed stays true while it is hidden, so that flag
+        // is not part of this check.
+        let wheel_reveals = event.wheel
+            && Self::with_mut(app, |app| {
+                app.settings.show_on_scroll || app.prompt_pending || !app.hidden
+            });
+        if event.button || wheel_reveals {
             Self::with_mut(app, |app| app.capture_position());
             note_pointer_activity(app);
         }
@@ -202,7 +218,7 @@ impl App {
                 CursorRefresh::Ignore
             } else if app.prompt_pending
                 || !desktop::thread_on_input_desktop()
-                || desktop::consent_prompt_running()
+                || desktop::blocking_prompt()
             {
                 CursorRefresh::Suspend
             } else if app.settle_active() {
@@ -213,10 +229,15 @@ impl App {
                 } else {
                     CursorRefresh::Reshow
                 }
-            } else if !app.hidden
-                || app
-                    .last_reapply
-                    .is_some_and(|instant| instant.elapsed() < Duration::from_millis(100))
+            } else if !app.hidden {
+                // The dialog can reload cursors after we already decided the pointer
+                // was shown, which leaves a blank pointer that movement would ignore.
+                app.show_on_next_move = true;
+                app.update_desktop_timer();
+                CursorRefresh::Ignore
+            } else if app
+                .last_reapply
+                .is_some_and(|instant| instant.elapsed() < Duration::from_millis(100))
             {
                 CursorRefresh::Ignore
             } else {
@@ -441,7 +462,7 @@ impl App {
     }
 
     fn update_desktop_timer(&mut self) {
-        if self.hidden || self.prompt_pending {
+        if self.hidden || self.prompt_pending || self.show_on_next_move || self.blank_installed {
             self.arm_desktop_timer();
         } else {
             self.kill_desktop_timer();
@@ -511,6 +532,10 @@ fn apply_command(app: *mut App, command: MenuCommand) {
             let value = App::with_mut(app, |app| !app.settings.hide_on_idle);
             persist_bool(app, "hide_on_idle", value);
         }
+        MenuCommand::ToggleScroll => {
+            let value = App::with_mut(app, |app| !app.settings.show_on_scroll);
+            persist_bool(app, "show_on_scroll", value);
+        }
         MenuCommand::SetTimeout(milliseconds) => persist_timeout(app, milliseconds),
         MenuCommand::ToggleStartup => {
             let value = App::with_mut(app, |app| !app.settings.start_with_windows);
@@ -538,6 +563,10 @@ fn persist_bool(app: *mut App, key: &str, value: bool) {
             }
             "hide_on_idle" => {
                 new_settings.hide_on_idle = value;
+                true
+            }
+            "show_on_scroll" => {
+                new_settings.show_on_scroll = value;
                 true
             }
             "show_tray" => {
@@ -718,7 +747,7 @@ fn sample_pointer(app: *mut App) -> bool {
 fn note_pointer_activity(app: *mut App) {
     let restore = App::with_mut(app, |app| {
         app.last_activity = Instant::now();
-        app.hidden || app.prompt_pending
+        app.hidden || app.prompt_pending || app.show_on_next_move || app.blank_installed
     });
     if restore {
         show_pointer(app);
@@ -729,7 +758,7 @@ fn note_pointer_activity(app: *mut App) {
 
 fn try_hide(app: *mut App) {
     let away = !desktop::thread_on_input_desktop()
-        || desktop::consent_prompt_running()
+        || desktop::blocking_prompt()
         || App::with_mut(app, |app| app.prompt_pending);
     if away {
         sync_prompt(app);
@@ -748,7 +777,7 @@ fn try_hide(app: *mut App) {
 }
 
 fn apply_blank(app: *mut App) {
-    if !desktop::thread_on_input_desktop() || desktop::consent_prompt_running() {
+    if !desktop::thread_on_input_desktop() || desktop::blocking_prompt() {
         sync_prompt(app);
         return;
     }
@@ -780,6 +809,7 @@ fn apply_blank(app: *mut App) {
                     );
                 }
                 app.hidden = true;
+                app.blank_installed = true;
                 app.update_desktop_timer();
             });
             if busy {
@@ -826,7 +856,7 @@ fn show_pointer(app: *mut App) {
         if !desktop::thread_on_input_desktop() {
             return ShowKind::Hold;
         }
-        if app.hidden {
+        if app.hidden || app.show_on_next_move || app.blank_installed {
             app.applying = true;
             return ShowKind::Show;
         }
@@ -843,18 +873,24 @@ fn show_on_input_desktop(app: *mut App) {
     let restored = cursor::reload_system_cursors();
     App::with_mut(app, |app| {
         app.applying = false;
+        let was_hidden = app.hidden || cursor::marker_exists();
         let on_input = desktop::thread_on_input_desktop();
-        let consent = desktop::consent_prompt_running();
+        let blocking = desktop::blocking_prompt();
         if restored && on_input {
             cursor::delete_marker();
             app.hidden = false;
-            if consent {
+            app.show_on_next_move = false;
+            // A dialog can copy the blank pointer and put it back when it closes.
+            // Keep reloading on movement until that dialog is gone.
+            app.blank_installed = blocking;
+            if blocking {
                 if !app.prompt_pending {
-                    app.prompt_was_hidden = false;
-                    tracing::info!("suspended hiding for a consent prompt");
+                    app.prompt_was_hidden = was_hidden;
+                    app.prompt_anchor = pointer_position().unwrap_or(app.last_counted);
+                    tracing::info!("suspended hiding for a system prompt");
                 }
                 app.prompt_pending = true;
-                tracing::info!("pointer shown for a consent prompt");
+                tracing::info!("pointer shown for a system prompt");
             } else {
                 clear_prompt(app);
                 tracing::info!("pointer shown");
@@ -946,7 +982,7 @@ fn sync_prompt(app: *mut App) {
             return PromptPhase::Idle;
         }
         let on_input = desktop::thread_on_input_desktop();
-        let consent = desktop::consent_prompt_running();
+        let consent = desktop::blocking_prompt();
         let away = !on_input || consent;
         if away {
             if !app.prompt_pending {
@@ -971,7 +1007,7 @@ fn sync_prompt(app: *mut App) {
         } else if app.prompt_pending {
             app.applying = true;
             PromptPhase::Finish
-        } else if app.hidden
+        } else if (app.hidden || app.show_on_next_move || app.blank_installed)
             && pointer_position().is_some_and(|position| {
                 moved_enough(
                     app.last_counted,
@@ -1022,7 +1058,7 @@ fn finish_entry(app: *mut App, on_input: bool) {
 
 fn finish_return(app: *mut App) {
     let action = App::with_mut(app, |app| {
-        let back = desktop::thread_on_input_desktop() && !desktop::consent_prompt_running();
+        let back = desktop::thread_on_input_desktop() && !desktop::blocking_prompt();
         if !back {
             app.applying = false;
             app.update_desktop_timer();
@@ -1061,6 +1097,7 @@ fn finish_return_hide(app: *mut App) {
         match result {
             Ok(_) => {
                 app.hidden = true;
+                app.blank_installed = true;
                 clear_prompt(app);
                 app.settle_until = Some(Instant::now() + HIDE_QUIET);
                 app.reregister_input = true;
@@ -1098,6 +1135,8 @@ fn finish_return_show(app: *mut App) {
         }
         cursor::delete_marker();
         app.hidden = false;
+        app.blank_installed = false;
+        app.show_on_next_move = false;
         clear_prompt(app);
         app.settle_until = Some(Instant::now() + HIDE_QUIET);
         app.reregister_input = true;
@@ -1128,6 +1167,7 @@ fn reassert_hidden(app: *mut App) {
         app.applying = false;
         if result.is_ok() {
             app.hidden = true;
+            app.blank_installed = true;
             app.kill_idle_timer();
         }
         app.update_desktop_timer();
@@ -1159,7 +1199,7 @@ fn reassert_shown(app: *mut App) {
 }
 
 fn prompt_is_over() -> bool {
-    desktop::thread_on_input_desktop() && !desktop::consent_prompt_running()
+    desktop::thread_on_input_desktop() && !desktop::blocking_prompt()
 }
 
 fn clear_prompt(app: &mut App) {
